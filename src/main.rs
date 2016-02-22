@@ -4,6 +4,7 @@ extern crate phf;
 
 use std::{mem, slice, ptr};
 use std::fs::File;
+use std::ffi::{CStr, CString};
 
 use libc::size_t;
 
@@ -14,6 +15,7 @@ use llvm::target::{
     LLVM_InitializeNativeAsmPrinter,
     LLVM_InitializeNativeAsmParser
 };
+use llvm::target_machine::LLVMGetDefaultTargetTriple;
 use llvm::prelude::*;
 
 
@@ -26,9 +28,11 @@ fn main() {
     let ctxt = unsafe { LLVMContextCreate() };
 
     // Load and optimize the runtime files.
-    let target = "x86_64-uknown-linux";
+    let target = unsafe {
+        CString::from_raw(LLVMGetDefaultTargetTriple())
+    };
     let optimize = true;
-    let runtime_modules = load_runtime_for_target(ctxt, target, optimize).expect("Failed to load runtime");
+    let runtime_modules = load_runtime_for_target(ctxt, &target, optimize).expect("Failed to load runtime");
 
     // Build main()
     let main_module = unsafe {
@@ -49,8 +53,8 @@ fn main() {
 
     let obj_file = File::create("out.o").expect("Could not open output file for writing");
     unsafe {
-        LLVMDumpModule(main_module);
-        write_target_code(main_module, obj_file).unwrap();
+        //LLVMDumpModule(main_module);
+        write_target_code(&target, main_module, obj_file).unwrap();
         LLVMContextDispose(ctxt);
     }
 }
@@ -68,13 +72,15 @@ impl From<std::io::Error> for IRLoadError {
 }
 
 fn module_from_blob(ctxt: LLVMContextRef, code: &[u8]) -> Result<LLVMModuleRef, IRLoadError> {
-    use std::ffi::CStr;
+    // ParseIRInContext seems to assume a null-terminated buffer, so sadly
+    // we must reallocate.
+    let mut code: Vec<u8> = code.into();
+    code.push(0);
 
-    println!("module_from_blob {}", std::str::from_utf8(code).unwrap());
     unsafe {
         let mbuf = LLVMCreateMemoryBufferWithMemoryRange(code.as_ptr() as *const _,
                                                          code.len() as size_t,
-                                                         b"\0".as_ptr() as *const _, 0);
+                                                         b"\0".as_ptr() as *const _, 1);
 
         let mut module: LLVMModuleRef = mem::uninitialized();
         let mut err_msg: *mut i8 = mem::uninitialized();
@@ -159,15 +165,15 @@ fn optimize_module(llmod: LLVMModuleRef) -> LLVMModuleRef {
     }
 }
 
-fn write_target_code<W: std::io::Write>(llmod: LLVMModuleRef, mut w: W) -> std::io::Result<()> {
+fn write_target_code<W: std::io::Write>(triple: &CStr, llmod: LLVMModuleRef, mut w: W) -> std::io::Result<()> {
     use llvm::target_machine::*;
     use llvm::target_machine::LLVMCodeGenFileType::*;
     use llvm::target_machine::LLVMCodeGenOptLevel::*;
     use llvm::target_machine::LLVMRelocMode::*;
     use llvm::target_machine::LLVMCodeModel::*;
 
+    let triple = triple.as_ptr();
     unsafe {
-        let triple = LLVMGetDefaultTargetTriple();
         let mut target = mem::uninitialized();
         LLVMGetTargetFromTriple(triple, &mut target, ptr::null_mut());
         let tm = LLVMCreateTargetMachine(target, triple,
@@ -209,7 +215,7 @@ impl From<IRLoadError> for RuntimeLoadError {
     }
 }
 
-fn load_runtime_for_target(ctxt: LLVMContextRef, target: &str, optimize: bool) -> Result<Vec<LLVMModuleRef>,
+fn load_runtime_for_target(ctxt: LLVMContextRef, target: &CStr, optimize: bool) -> Result<Vec<LLVMModuleRef>,
                                                                                          RuntimeLoadError> {
     let mut rt_modules = Vec::with_capacity(RT_SOURCES.len() + 1);
     
@@ -220,9 +226,8 @@ fn load_runtime_for_target(ctxt: LLVMContextRef, target: &str, optimize: bool) -
         }
         rt_modules.push(llmod);
     }
-    println!("Loaded target-independent runtime IR");
 
-    let target_rt_source = match RT_TARGET_SOURCES.get(target) {
+    let target_rt_source = match RT_TARGET_SOURCES.get(&*target.to_string_lossy()) {
         Some(s) => *s,
         None => return Err(RuntimeLoadError::NoSuchPlatform)
     };

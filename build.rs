@@ -21,7 +21,7 @@ fn main() {
     write!(&mut file, "static RT_TARGET_SOURCES: phf::Map<&'static str, &'static [u8; 2811]> =").unwrap();
     let mut phf = phf_codegen::Map::new();
 
-    rt_file!(phf, "x86_64-unknown-linux", "linux-x86_64");
+    rt_file!(phf, "x86_64-unknown-linux-gnu", "linux-x86_64");
 
     phf.build(&mut file).unwrap();
     write!(&mut file, ";\n").unwrap();
