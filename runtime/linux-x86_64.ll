@@ -6,7 +6,7 @@ target triple = "x86_64-unknown-linux"
 @__NR_open = private constant i64 2
 @__NR_exit = private constant i64 60
 
-@STDOUT_FILENO = constant i32 1
+@STDOUT_FILENO = private constant i32 1
 
 define private i64 @syscall1(i64 %nr, i64 %p1) inlinehint {
     %1 = call i64 asm sideeffect "syscall",
@@ -28,7 +28,7 @@ define private i64 @syscall3(i64 %nr, i64 %p1, i64 %p2, i64 %p3) inlinehint {
 
 ; ===
 
-define hidden i32 @open(i8* %path0, i32 %flags0) {
+define private i32 @open(i8* %path0, i32 %flags0) {
     %nr = load i64, i64* @__NR_open
     %path = ptrtoint i8* %path0 to i64
     %flags = zext i32 %flags0 to i64
@@ -37,7 +37,7 @@ define hidden i32 @open(i8* %path0, i32 %flags0) {
     ret i32 %out
 }
 
-define hidden i64 @read(i32 %fd0, i8* %buf0, i64 %len) {
+define private i64 @read(i32 %fd0, i8* %buf0, i64 %len) {
     %nr = load i64, i64* @__NR_read
     %fd = zext i32 %fd0 to i64
     %buf = ptrtoint i8* %buf0 to i64
@@ -45,7 +45,7 @@ define hidden i64 @read(i32 %fd0, i8* %buf0, i64 %len) {
     ret i64 %out
 }
 
-define hidden void @exit(i32 %code0) noreturn {
+define private void @exit(i32 %code0) noreturn {
     %nr_exit = load i64, i64* @__NR_exit
     %code = zext i32 %code0 to i64
     call i64 @syscall1(i64 %nr_exit, i64 %code)
@@ -84,7 +84,7 @@ exit_fail:
 }
 
 ; Runtime support function to print characters to stdou
-define void @print(i8* %buf0, i8 %len0) inlinehint {
+define hidden void @print(i8* %buf0, i8 %len0) inlinehint {
     %nr = load i64, i64* @__NR_write
     %fileno0 = load i32, i32* @STDOUT_FILENO
     %fileno = zext i32 %fileno0 to i64
