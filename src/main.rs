@@ -16,6 +16,7 @@ use llvm::target::{
     LLVM_InitializeNativeAsmParser
 };
 use llvm::target_machine::LLVMGetDefaultTargetTriple;
+use llvm::LLVMLinkage;
 use llvm::prelude::*;
 
 
@@ -49,7 +50,7 @@ fn main() {
     };
 
     // Combine main() and runtime with LTO
-    let main_module = optimize_lto(main_module, runtime_modules.into_iter());
+    let main_module = optimize_lto(main_module, runtime_modules.into_iter(), &[b"_start"]);
 
     let obj_file = File::create("out.o").expect("Could not open output file for writing");
     unsafe {
@@ -112,10 +113,24 @@ fn link_modules<I: IntoIterator<Item=LLVMModuleRef>>(main: LLVMModuleRef, iter: 
     main
 }
 
-fn optimize_lto<I: IntoIterator<Item=LLVMModuleRef>>(llmod: LLVMModuleRef, mods: I) -> LLVMModuleRef {
+fn optimize_lto<I: IntoIterator<Item=LLVMModuleRef>>(llmod: LLVMModuleRef,
+                                                     mods: I, externals: &[&[u8]]) -> LLVMModuleRef {
     use llvm::transforms::pass_manager_builder::*;
 
+    // Combine modules
     let llmod = link_modules(llmod, mods);
+    // Mark all functions except externals as private
+    unsafe {
+        let mut func = LLVMGetFirstFunction(llmod);
+        while func != ptr::null_mut() {
+            let func_name = CStr::from_ptr(LLVMGetValueName(func));
+            if !externals.contains(&func_name.to_bytes()) {
+                LLVMSetLinkage(func, LLVMLinkage::LLVMPrivateLinkage);
+            }
+
+            func = LLVMGetNextFunction(func);
+        }
+    }
 
     unsafe {
         let pm = LLVMCreatePassManager();
