@@ -83,7 +83,7 @@ exit_fail:
     unreachable
 }
 
-; Runtime support function to print characters to stdou
+; Runtime support function to print characters to stdout
 define hidden void @print(i8* %buf0, i8 %len0) inlinehint {
     %nr = load i64, i64* @__NR_write
     %fileno0 = load i32, i32* @STDOUT_FILENO

@@ -19,6 +19,7 @@ use llvm::target_machine::LLVMGetDefaultTargetTriple;
 use llvm::LLVMLinkage;
 use llvm::prelude::*;
 
+type LLVMError = String;
 
 fn main() {
     unsafe {
@@ -32,47 +33,119 @@ fn main() {
     let target = unsafe {
         CString::from_raw(LLVMGetDefaultTargetTriple())
     };
-    let optimize = true;
+    let optimize = false;
     let runtime_modules = load_runtime_for_target(ctxt, &target, optimize).expect("Failed to load runtime");
 
     // Build main()
-    let main_module = unsafe {
+    let (main_module, main_function) = unsafe {
         let ty_void = LLVMVoidType();
         let main_module = LLVMModuleCreateWithNameInContext(b"main\0".as_ptr() as *const _, ctxt);
         let ty_fn_main = LLVMFunctionType(ty_void, ptr::null_mut(), 0, 0);
         let main_function = LLVMAddFunction(main_module, b"main\0".as_ptr() as *const _, ty_fn_main);
-        let bb_main = LLVMAppendBasicBlockInContext(ctxt, main_function, b"\0".as_ptr() as *const _);
-        let b = LLVMCreateBuilderInContext(ctxt);
-        LLVMPositionBuilderAtEnd(b, bb_main);
-        LLVMBuildRetVoid(b);
 
-        main_module
+        (main_module, main_function)
     };
+    compile_merthese(ctxt, main_function, main_module, "trte".chars());
 
-    // Combine main() and runtime with LTO
-    let main_module = optimize_lto(main_module, runtime_modules.into_iter(), &[b"_start"]);
+    // Combine main() and runtime
+    link_modules(main_module, runtime_modules);
+    // Do LTO if desired
+    if optimize {
+        optimize_lto(main_module, &[b"_start"]);
+    }
 
     let obj_file = File::create("out.o").expect("Could not open output file for writing");
     unsafe {
-        //LLVMDumpModule(main_module);
+        LLVMDumpModule(main_module);
         write_target_code(&target, main_module, obj_file).unwrap();
         LLVMContextDispose(ctxt);
     }
 }
 
-#[derive(Debug)]
-enum IRLoadError {
-    IOError(std::io::Error),
-    LLVMError(String)
-}
-
-impl From<std::io::Error> for IRLoadError {
-    fn from(x: std::io::Error) -> IRLoadError {
-        IRLoadError::IOError(x)
+fn ptr_to_const(llmod: LLVMModuleRef, ty: LLVMTypeRef, value: LLVMValueRef, name: &[u8]) -> LLVMValueRef {
+    unsafe {
+        let g = LLVMAddGlobal(llmod, ty, name.as_ptr() as *const _);
+        LLVMSetInitializer(g, value);
+        LLVMSetGlobalConstant(g, 1);
+        LLVMConstInBoundsGEP(g, [LLVMConstInt(LLVMIntType(8), 0, 0)].as_ptr() as *mut _, 0)
     }
 }
 
-fn module_from_blob(ctxt: LLVMContextRef, code: &[u8]) -> Result<LLVMModuleRef, IRLoadError> {
+fn compile_merthese<I: Iterator<Item=char>>(ctxt: LLVMContextRef, llfn: LLVMValueRef,
+                                            llmod: LLVMModuleRef, mut code: I) {
+    unsafe {
+        let bb_main = LLVMAppendBasicBlockInContext(ctxt, llfn, b"\0".as_ptr() as *const _);
+        let b = LLVMCreateBuilderInContext(ctxt);
+        LLVMPositionBuilderAtEnd(b, bb_main);
+
+        // Types
+        let ty_void = LLVMVoidType();
+        let ty_i8 = LLVMIntType(8);
+        let ty_i8p = LLVMPointerType(ty_i8, 0);
+        let ty_rt_rand_inrange = LLVMFunctionType(ty_i8, [ty_i8].as_ptr() as *mut _, 1, 0);
+        let ty_rt_rand_string = LLVMFunctionType(ty_void, [ty_i8].as_ptr() as *mut _, 1, 0);
+        let ty_rt_print = LLVMFunctionType(ty_void, [ty_i8p, ty_i8].as_ptr() as *mut _, 2, 0);
+        // Runtime functions
+        let rt_rand_inrange = LLVMAddGlobal(llmod, ty_rt_rand_inrange, b"rand_inrange\0".as_ptr() as *const _);
+        let rt_rand_string = LLVMAddGlobal(llmod, ty_rt_rand_string, b"rand_string\0".as_ptr() as *const _);
+        let rt_print = LLVMAddGlobal(llmod, ty_rt_print, b"print\0".as_ptr() as *const _);
+
+        // Constant ints
+        let v_0i8 = LLVMConstInt(ty_i8, 0, 0);
+        let v_1i8 = LLVMConstInt(ty_i8, 1, 0);
+        let v_5i8 = LLVMConstInt(ty_i8, 5, 0);
+        let v_10i8 = LLVMConstInt(ty_i8, 10, 0);
+        // Parameter for print in 'm'
+        let v_merth = LLVMBuildGlobalStringPtr(b, b"merth\0".as_ptr() as *const _,
+                                               b"MERTH\0".as_ptr() as *const _);
+        // Parameter for print in 'e'
+        let v_newline = ptr_to_const(llmod, ty_i8, LLVMConstInt(ty_i8, 10, 0), b"NEWLINE\0");
+        // Parameter for print in 'r'
+        let v_space = ptr_to_const(llmod, ty_i8, LLVMConstInt(ty_i8, 32, 0), b"SPACE\0");
+
+        while let Some(c) = code.next() {
+            match c {
+                'm' => {
+                    LLVMBuildCall(b, rt_print, [v_merth, v_5i8].as_ptr() as *mut _,
+                                  2, b"\0".as_ptr() as *const _);
+                }
+                'e' => {
+                    LLVMBuildCall(b, rt_print, [v_newline, v_1i8].as_ptr() as *mut _,
+                                  2, b"\0".as_ptr() as *const _);
+                }
+                'r' => {
+                    LLVMBuildCall(b, rt_print, [v_space, v_1i8].as_ptr() as *mut _,
+                                  2, b"\0".as_ptr() as *const _);
+                }
+                't' => {
+                    let v_len = LLVMBuildCall(b, rt_rand_inrange,
+                                              [LLVMConstAdd(
+                                                  LLVMConstFPToUI(
+                                                      LLVMConstReal(LLVMFloatType(), 13.4), ty_i8
+                                                  ),
+                                                  v_1i8
+                                              )].as_ptr() as *mut _,
+                                              1, b"\0".as_ptr() as *const _);
+                    LLVMBuildCall(b, rt_rand_string, [v_len].as_ptr() as *mut _,
+                                  1, b"\0".as_ptr() as *const _);
+                }
+                'h' => {
+                    loop {
+                        match code.next() {
+                            Some('h') | None => break,
+                            _ => continue
+                        }
+                    }
+                }
+                _ => unimplemented!()
+            }
+        }
+
+        LLVMBuildRetVoid(b);
+    }
+}
+
+fn module_from_blob(ctxt: LLVMContextRef, code: &[u8]) -> Result<LLVMModuleRef, LLVMError> {
     // ParseIRInContext seems to assume a null-terminated buffer, so sadly
     // we must reallocate.
     let mut code: Vec<u8> = code.into();
@@ -91,9 +164,9 @@ fn module_from_blob(ctxt: LLVMContextRef, code: &[u8]) -> Result<LLVMModuleRef, 
         let result = LLVMParseIRInContext(ctxt, mbuf, &mut module, &mut err_msg);
 
         if result != 0 {
-            Err(IRLoadError::LLVMError(
+            Err(
                 CStr::from_ptr(err_msg).to_string_lossy().into_owned()
-            ))
+            )
         } else {
             Ok(module)
         }
@@ -113,12 +186,9 @@ fn link_modules<I: IntoIterator<Item=LLVMModuleRef>>(main: LLVMModuleRef, iter: 
     main
 }
 
-fn optimize_lto<I: IntoIterator<Item=LLVMModuleRef>>(llmod: LLVMModuleRef,
-                                                     mods: I, externals: &[&[u8]]) -> LLVMModuleRef {
+fn optimize_lto(llmod: LLVMModuleRef, externals: &[&[u8]]) -> LLVMModuleRef {
     use llvm::transforms::pass_manager_builder::*;
 
-    // Combine modules
-    let llmod = link_modules(llmod, mods);
     // Mark all functions except externals as private
     unsafe {
         let mut func = LLVMGetFirstFunction(llmod);
@@ -220,18 +290,18 @@ static RT_SOURCES: &'static [&'static [u8]] = &[
 
 #[derive(Debug)]
 enum RuntimeLoadError {
-    InvalidIR(IRLoadError),
+    InvalidIR(LLVMError),
     NoSuchPlatform
 }
 
-impl From<IRLoadError> for RuntimeLoadError {
-    fn from(x: IRLoadError) -> RuntimeLoadError {
+impl From<LLVMError> for RuntimeLoadError {
+    fn from(x: LLVMError) -> RuntimeLoadError {
         RuntimeLoadError::InvalidIR(x)
     }
 }
 
-fn load_runtime_for_target(ctxt: LLVMContextRef, target: &CStr, optimize: bool) -> Result<Vec<LLVMModuleRef>,
-                                                                                         RuntimeLoadError> {
+fn load_runtime_for_target(ctxt: LLVMContextRef, target: &CStr, optimize: bool)
+        -> Result<Vec<LLVMModuleRef>, RuntimeLoadError> {
     let mut rt_modules = Vec::with_capacity(RT_SOURCES.len() + 1);
     
     for irmod in RT_SOURCES {

@@ -1,50 +1,64 @@
 
-@x = private unnamed_addr global i32 0
-@y = private unnamed_addr global i32 0
-@z = private unnamed_addr global i32 0
-@w = private unnamed_addr global i32 0
+@x = private unnamed_addr global i64 0
 
-define hidden void @rand_init([4 x i32]* %buf) {
-    %b0 = getelementptr inbounds [4 x i32], [4 x i32]* %buf, i32 0, i32 0
-    %b1 = getelementptr inbounds [4 x i32], [4 x i32]* %buf, i32 0, i32 1
-    %b2 = getelementptr inbounds [4 x i32], [4 x i32]* %buf, i32 0, i32 2
-    %b3 = getelementptr inbounds [4 x i32], [4 x i32]* %buf, i32 0, i32 3
-    %1 = load i32, i32* %b0
-    %2 = load i32, i32* %b1
-    %3 = load i32, i32* %b2
-    %4 = load i32, i32* %b3
-    store i32 %1, i32* @x
-    store i32 %2, i32* @y
-    store i32 %3, i32* @z
-    store i32 %4, i32* @w
+define hidden void @rand_init(i64 %seed) {
+    store i64 %seed, i64* @x
     ret void
 }
 
-define hidden i32 @rand() {
-;    uint32_t t = x;
-    %t0 = load i32, i32* @x
-    %tsl11 = shl i32 %t0, 11
-    %tsr8 = lshr i32 %t0, 8
-;    t ^= t << 11;
-    %t1 = xor i32 %t0, %tsl11
-;    t ^= t >> 8;
-    %t2 = xor i32 %t1, %tsr8
-;    x = y;
-    %1 = load i32, i32* @y
-    store i32 %1, i32* @x
-;    y = z;
-    %2 = load i32, i32* @z
-    store i32 %2, i32* @y
-;    z = w;
-    %3 = load i32, i32* @w
-    store i32 %2, i32* @z
-;    w ^= w >> 19;
-    %w0 = load i32, i32* @w
-    %wsr19 = lshr i32 %w0, 19
-    %w1 = xor i32 %w0, %wsr19
-;    w ^= t;
-    %w2 = xor i32 %w1, %t2
-    store i32 %w2, i32* @w
-;    return w;
-    ret i32 %w2
+; 64-bit xorshift*
+define hidden i64 @rand() {
+    %x0 = load i64, i64* @x
+;   x ^= x >> 12;
+    %xr12 = lshr i64 %x0, 12
+    %x1 = xor i64 %x0, %xr12
+;   x ^= x << 25;
+    %xl25 = shl i64 %x1, 25
+    %x2 = xor i64 %x1, %xl25
+;   x ^= x >> 27;
+    %xr27 = lshr i64 %x2, 27
+    %x3 = xor i64 %x2, %xr27
+    store i64 %x3, i64* @x
+
+;   return x * 2685821657736338717;
+    %out = mul i64 %x3, 2685821657736338717
+    ret i64 %out
+}
+
+define hidden i8 @rand_inrange(i8 %max0) {
+    %1 = call i64 @rand()
+    %2 = uitofp i64 %1 to double
+    %3 = fdiv fast double %2, uitofp(i65 shl(i65 1, i65 64) to double)
+    ; %3 is in range [0, 1)
+    %max = uitofp i8 %max0 to double
+    %4 = fmul fast double %3, %max
+    %5 = fptoui double %4 to i8
+    ret i8 %5
+}
+
+declare void @print(i8*, i8)
+
+define hidden void @rand_string(i8 %len) {
+    %charmem = alloca i8, i8 %len
+    br label %loop
+
+loop:
+    %idx = phi i8 [0, %0], [%idxinc, %loop_cont]
+    %equal = icmp eq i8 %idx, %len
+    br i1 %equal, label %done, label %loop_cont
+
+loop_cont:
+    ; Generate and store a character
+    %char_ = call i8 @rand_inrange(i8 26)
+    %char = add i8 %char_, 97
+
+    %charp = getelementptr inbounds i8, i8* %charmem, i8 %idx
+    store i8 %char, i8* %charp
+
+    %idxinc = add i8 %idx, 1
+    br label %loop
+
+done:
+    call void @print(i8* %charmem, i8 %len)
+    ret void
 }
