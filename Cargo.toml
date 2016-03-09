@@ -5,9 +5,11 @@ authors = ["Peter Marheine <peter@taricorp.net>"]
 build = "build.rs"
 
 [dependencies]
+docopt = "0.6"
 llvm-sys = "0.2"
 libc = "0.2"
 phf = "0.7"
+rustc-serialize = "0.3"
 
 [build-dependencies]
 phf_codegen = "0.7"
