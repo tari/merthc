@@ -1,14 +1,19 @@
 extern crate docopt;
+extern crate env_logger;
 extern crate libc;
+#[macro_use] extern crate log;
 extern crate llvm_sys as llvm;
 extern crate phf;
 extern crate rustc_serialize;
+extern crate tempfile;
 
 use docopt::Docopt;
 use std::{mem, slice, ptr};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::ffi::{CStr, CString};
 use std::io::Read;
+use std::process::Command;
+use tempfile::NamedTempFile;
 
 use libc::size_t;
 
@@ -19,7 +24,8 @@ use llvm::target::{
     LLVM_InitializeNativeAsmPrinter,
     LLVM_InitializeNativeAsmParser
 };
-use llvm::target_machine::LLVMGetDefaultTargetTriple;
+use llvm::target_machine::{LLVMCodeGenFileType, LLVMGetDefaultTargetTriple};
+use llvm::target_machine::LLVMCodeGenFileType::*;
 use llvm::LLVMLinkage;
 use llvm::prelude::*;
 
@@ -45,22 +51,70 @@ struct Args {
     arg_outfile: Option<String>
 }
 
-#[derive(Debug, RustcDecodable)]
+#[derive(PartialEq, Eq, Debug, RustcDecodable)]
 enum Emit { Asm, Ir, Obj, Link }
 
 fn main() {
-    let args: Args = Docopt::new(USAGE).expect("USAGE string is invalid")
-                            .help(true)
-                            .argv(std::env::args())
-                            .decode().unwrap_or_else(|e| e.exit());
-    println!("{:?}", args);
+    env_logger::init().unwrap();
+    let Args {
+        flag_no_opt: no_optimize,
+        flag_emit: emit,
+        arg_source: inpath,
+        arg_outfile: outpath,
+    } = Docopt::new(USAGE).expect("USAGE string is invalid")
+                          .help(true)
+                          .argv(std::env::args())
+                          .decode().unwrap_or_else(|e| e.exit());
+
+    let optimize = !no_optimize.unwrap_or(false);
+    let emit = emit.unwrap_or(Emit::Link);
+
+    let outpath = if outpath.is_none() {
+        // Select a default output filename
+        let inpath_base: String = if emit == Emit::Link && inpath.is_none() {
+            (if cfg!(target_os="windows") {
+                "a.exe"
+            } else {
+                "a.out"
+            }).into()
+        } else {
+            inpath.clone().map_or("out".into(), |s| {
+                s[0 .. s.rfind('.').unwrap_or(s.len())].into()
+            })
+        };
+        let outpath_suffix = match emit {
+            Emit::Asm => ".S",
+            Emit::Ir => ".ll",
+            Emit::Obj => ".o",
+            Emit::Link => if cfg!(target_os="windows") { ".exe" } else { "" }
+        };
+        inpath_base + outpath_suffix
+    } else {
+        outpath.unwrap()
+    };
 
     let mut s = String::new();
-    std::io::stdin().read_to_string(&mut s).expect("Failed to read from stdin");
-    do_compile(s.chars());
+    let mut infile: Box<Read> = match inpath {
+        None => Box::new(std::io::stdin()),
+        Some(p) => Box::new(File::open(p).expect("Failed to open input file"))
+    };
+    infile.read_to_string(&mut s).expect("Failed to read source code");
+
+    let mut oo = OpenOptions::new();
+    oo.create(true);
+    if cfg!(unix) && emit == Emit::Link {
+        // Make the file executable if linking on unix.
+        use std::os::unix::fs::OpenOptionsExt;
+        oo.mode(777);
+    }
+    let outfile = File::create(outpath).expect("Failed to open output file for writing");
+
+    do_compile(s.chars(), outfile, emit, optimize);
 }
 
-fn do_compile<I: Iterator<Item=char>>(source: I) {
+fn do_compile<I, W>(source: I, mut out: W, emit: Emit, optimize: bool)
+        where I: Iterator<Item=char>,
+              W: std::io::Write {
     unsafe {
         LLVM_InitializeNativeTarget();
         LLVM_InitializeNativeAsmPrinter();
@@ -72,7 +126,6 @@ fn do_compile<I: Iterator<Item=char>>(source: I) {
     let target = unsafe {
         CString::from_raw(LLVMGetDefaultTargetTriple())
     };
-    let optimize = false;
     let runtime_modules = load_runtime_for_target(ctxt, &target, optimize)
         .expect("Failed to load runtime");
 
@@ -95,9 +148,51 @@ fn do_compile<I: Iterator<Item=char>>(source: I) {
         optimize_lto(main_module, &[b"_start"]);
     }
 
-    let obj_file = File::create("out.o").expect("Could not open output file for writing");
+    match emit {
+        Emit::Obj => write_target_code(&target, main_module, LLVMObjectFile, out).unwrap(),
+        Emit::Asm => write_target_code(&target, main_module, LLVMAssemblyFile, out).unwrap(),
+        Emit::Link => {
+            let mut obj = NamedTempFile::new().expect("Failed to create temporary object file");
+            let mut temp_bin = NamedTempFile::new().expect("Failed to create temporary binary file");
+
+            // Kind of a mess. First write object code to a temporary file.
+            write_target_code(&target, main_module, LLVMObjectFile, &mut obj).unwrap();
+
+            // Then invoke the linker, writing to another temporary file.
+            let res = Command::new("ld")
+                              .arg("-o")
+                              .arg(temp_bin.path())
+                              .arg(obj.path())
+                              .status()
+                              .expect("could not invoke ld for linking");
+            // Permit removal of the object file. We don't need it anymore.
+            let _ = obj;
+            if !res.success() {
+                panic!("ld returned failure");
+            }
+
+            // Now move the temp binary to output.
+            const HUNK_SIZE: usize = 4096;
+            let mut buf = [0u8; HUNK_SIZE];
+            loop {
+                match temp_bin.read(&mut buf) {
+                    Err(e) => panic!("Unable to read temporary binary: {}", e),
+                    Ok(sz) => {
+                        out.write_all(&buf[..sz]).expect("Unable to write output binary");
+                        if sz < HUNK_SIZE {
+                            break;
+                        }
+                    }
+                }
+            }
+        },
+        Emit::Ir => {
+            // I'm not sure this is possible with the C API.
+            unimplemented!()
+        }
+    }
+
     unsafe {
-        write_target_code(&target, main_module, obj_file).unwrap();
         LLVMContextDispose(ctxt);
     }
 }
@@ -128,7 +223,6 @@ fn compile_merthese<I: Iterator<Item=char>>(ctxt: LLVMContextRef, llfn: LLVMValu
         // Runtime functions
         let rt_rand_inrange = LLVMAddGlobal(llmod, ty_rt_rand_inrange, b"rand_inrange\0".as_ptr() as *const _);
         let rt_rand_string = LLVMAddGlobal(llmod, ty_rt_rand_string, b"rand_string\0".as_ptr() as *const _);
-        //let rt_print = LLVMAddGlobal(llmod, ty_rt_print, b"print\0".as_ptr() as *const _);
         let rt_print = LLVMAddFunction(llmod, b"print\0".as_ptr() as *const _, ty_rt_print);
 
         // Constant ints
@@ -189,6 +283,7 @@ type LLVMError = String;
 fn module_from_blob(ctxt: LLVMContextRef, code: &[u8]) -> Result<LLVMModuleRef, LLVMError> {
     // ParseIRInContext seems to assume a null-terminated buffer, so sadly
     // we must reallocate.
+    trace!("Compiling module from IR: {}", &String::from_utf8_lossy(code));
     let mut code: Vec<u8> = code.into();
     code.push(0);
 
@@ -237,10 +332,22 @@ fn optimize_lto(llmod: LLVMModuleRef, externals: &[&[u8]]) -> LLVMModuleRef {
         while func != ptr::null_mut() {
             let func_name = CStr::from_ptr(LLVMGetValueName(func));
             if !externals.contains(&func_name.to_bytes()) {
+                debug!("Marking function {} as private in LTO", &func_name.to_string_lossy());
                 LLVMSetLinkage(func, LLVMLinkage::LLVMPrivateLinkage);
             }
 
             func = LLVMGetNextFunction(func);
+        }
+
+        let mut glob = LLVMGetFirstGlobal(llmod);
+        while glob != ptr::null_mut() {
+            let glob_name = CStr::from_ptr(LLVMGetValueName(glob));
+            if !externals.contains(&glob_name.to_bytes()) {
+                debug!("Marking global {} as private in LTO", &glob_name.to_string_lossy());
+                LLVMSetLinkage(glob, LLVMLinkage::LLVMPrivateLinkage);
+            }
+
+            glob = LLVMGetNextGlobal(glob);
         }
     }
 
@@ -292,9 +399,9 @@ fn optimize_module(llmod: LLVMModuleRef) -> LLVMModuleRef {
     }
 }
 
-fn write_target_code<W: std::io::Write>(triple: &CStr, llmod: LLVMModuleRef, mut w: W) -> std::io::Result<()> {
+fn write_target_code<W: std::io::Write>(triple: &CStr, llmod: LLVMModuleRef,
+                                        ty: LLVMCodeGenFileType, mut w: W) -> std::io::Result<()> {
     use llvm::target_machine::*;
-    use llvm::target_machine::LLVMCodeGenFileType::*;
     use llvm::target_machine::LLVMCodeGenOptLevel::*;
     use llvm::target_machine::LLVMRelocMode::*;
     use llvm::target_machine::LLVMCodeModel::*;
@@ -309,7 +416,7 @@ fn write_target_code<W: std::io::Write>(triple: &CStr, llmod: LLVMModuleRef, mut
                                          LLVMCodeModelDefault);
 
         let mut mbuf: LLVMMemoryBufferRef = mem::uninitialized();
-        LLVMTargetMachineEmitToMemoryBuffer(tm, llmod, LLVMObjectFile, ptr::null_mut(), &mut mbuf);
+        LLVMTargetMachineEmitToMemoryBuffer(tm, llmod, ty, ptr::null_mut(), &mut mbuf);
         let out = w.write_all(membuf_as_slice(mbuf));
 
         LLVMDisposeTargetMachine(tm);
@@ -347,16 +454,16 @@ fn load_runtime_for_target(ctxt: LLVMContextRef, target: &CStr, optimize: bool)
     let mut rt_modules = Vec::with_capacity(RT_SOURCES.len() + 1);
     
     for irmod in RT_SOURCES {
-        println!("Loading from RT_SOURCES\n{:?}", std::str::from_utf8(irmod));
+        debug!("Loading a module from RT_SOURCES");
         let mut llmod = try!(module_from_blob(ctxt, irmod));
         if optimize {
             llmod = optimize_module(llmod)
         }
         rt_modules.push(llmod);
     }
-    println!("Loaded all from RT_SOURCES");
+    debug!("Loaded all from RT_SOURCES");
 
-    println!("Loading RT_TARGET_SOURCES for {}", &*target.to_string_lossy());
+    debug!("Loading RT_TARGET_SOURCES for {}", &*target.to_string_lossy());
     let target_rt_source = match RT_TARGET_SOURCES.get(&*target.to_string_lossy()) {
         Some(s) => *s,
         None => return Err(RuntimeLoadError::NoSuchPlatform)
