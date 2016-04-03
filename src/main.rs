@@ -29,6 +29,12 @@ use llvm::target_machine::LLVMCodeGenFileType::*;
 use llvm::LLVMLinkage;
 use llvm::prelude::*;
 
+extern "C" {
+    fn PrintModuleIR(m: LLVMModuleRef,
+                     cb: extern "C" fn(*const u8, libc::size_t, *mut libc::c_void) -> libc::c_int,
+                     cb_data: *mut libc::c_void);
+}
+
 const USAGE: &'static str = "
 Usage: merthc [options] [<source>]
        merthc --help
@@ -101,13 +107,14 @@ fn main() {
     infile.read_to_string(&mut s).expect("Failed to read source code");
 
     let mut oo = OpenOptions::new();
-    oo.create(true);
+    oo.create(true).write(true);
     if cfg!(unix) && emit == Emit::Link {
-        // Make the file executable if linking on unix.
+        // Make the file executable if linking on unix (let umask handle
+        // any exclusions the user wants).
         use std::os::unix::fs::OpenOptionsExt;
-        oo.mode(777);
+        oo.mode(0o777);
     }
-    let outfile = File::create(outpath).expect("Failed to open output file for writing");
+    let outfile = oo.open(outpath).expect("Failed to open output file for writing");
 
     do_compile(s.chars(), outfile, emit, optimize);
 }
@@ -172,23 +179,22 @@ fn do_compile<I, W>(source: I, mut out: W, emit: Emit, optimize: bool)
             }
 
             // Now move the temp binary to output.
-            const HUNK_SIZE: usize = 4096;
-            let mut buf = [0u8; HUNK_SIZE];
-            loop {
-                match temp_bin.read(&mut buf) {
-                    Err(e) => panic!("Unable to read temporary binary: {}", e),
-                    Ok(sz) => {
-                        out.write_all(&buf[..sz]).expect("Unable to write output binary");
-                        if sz < HUNK_SIZE {
-                            break;
-                        }
-                    }
-                }
-            }
+            std::io::copy(&mut temp_bin, &mut out).expect("Unable to write output binary");
         },
         Emit::Ir => {
-            // I'm not sure this is possible with the C API.
-            unimplemented!()
+            extern "C" fn module_ir_printer<W: std::io::Write>(src: *const u8, size: libc::size_t,
+                                                               state: *mut libc::c_void) -> libc::c_int {
+                let (src, out) = unsafe {(
+                    slice::from_raw_parts(src, size),
+                    &mut *(state as *mut W)
+                )};
+                let _res = out.write_all(src);
+                0
+            }
+
+            unsafe {
+                PrintModuleIR(main_module, module_ir_printer::<W>, &mut out as *mut W as *mut libc::c_void);
+            }
         }
     }
 
@@ -275,6 +281,7 @@ fn compile_merthese<I: Iterator<Item=char>>(ctxt: LLVMContextRef, llfn: LLVMValu
         }
 
         LLVMBuildRetVoid(b);
+        LLVMDisposeBuilder(b);
     }
 }
 
