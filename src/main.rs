@@ -15,8 +15,6 @@ use std::io::Read;
 use std::process::Command;
 use tempfile::NamedTempFile;
 
-use libc::size_t;
-
 use llvm::core::*;
 use llvm::ir_reader::LLVMParseIRInContext;
 use llvm::target::{
@@ -30,6 +28,11 @@ use llvm::LLVMLinkage;
 use llvm::prelude::*;
 
 extern "C" {
+    /// Get the textual representation of a module's IR, passed by chunks to
+    /// a callback for usage.
+    ///
+    /// Calls `cb` with a pointer to data, the length of that data and a pointer
+    /// to some user-defined data (passed to the initial function as `cb_data`).
     fn PrintModuleIR(m: LLVMModuleRef,
                      cb: extern "C" fn(*const u8, libc::size_t, *mut libc::c_void) -> libc::c_int,
                      cb_data: *mut libc::c_void);
@@ -119,6 +122,7 @@ fn main() {
     do_compile(s.chars(), outfile, emit, optimize);
 }
 
+/// Do compilation of source, emitting the requested output format to `out`.
 fn do_compile<I, W>(source: I, mut out: W, emit: Emit, optimize: bool)
         where I: Iterator<Item=char>,
               W: std::io::Write {
@@ -133,8 +137,15 @@ fn do_compile<I, W>(source: I, mut out: W, emit: Emit, optimize: bool)
     let target = unsafe {
         CString::from_raw(LLVMGetDefaultTargetTriple())
     };
-    let runtime_modules = load_runtime_for_target(ctxt, &target, optimize)
-        .expect("Failed to load runtime");
+    let runtime_modules = match load_runtime_for_target(ctxt, &target, optimize) {
+        Ok(x) => x,
+        Err(RuntimeLoadError::NoSuchPlatform) => {
+            println!("Runtime for platform '{}' has no implementation. Sorry!",
+                     target.to_string_lossy());
+            return
+        }
+        e => panic!("Invalid IR while loading runtime: {:?}", e)
+    };
 
     // Build main()
     let (main_module, main_function) = unsafe {
@@ -156,14 +167,17 @@ fn do_compile<I, W>(source: I, mut out: W, emit: Emit, optimize: bool)
     }
 
     match emit {
-        Emit::Obj => write_target_code(&target, main_module, LLVMObjectFile, out).unwrap(),
-        Emit::Asm => write_target_code(&target, main_module, LLVMAssemblyFile, out).unwrap(),
+        Emit::Obj => write_target_code(&target, main_module, LLVMObjectFile, out)
+            .expect("Failed to write object code"),
+        Emit::Asm => write_target_code(&target, main_module, LLVMAssemblyFile, out)
+            .expect("Failed to write assembly file"),
         Emit::Link => {
             let mut obj = NamedTempFile::new().expect("Failed to create temporary object file");
             let mut temp_bin = NamedTempFile::new().expect("Failed to create temporary binary file");
 
             // Kind of a mess. First write object code to a temporary file.
-            write_target_code(&target, main_module, LLVMObjectFile, &mut obj).unwrap();
+            write_target_code(&target, main_module, LLVMObjectFile, &mut obj)
+                .expect("Failed to write object code to temporary file");
 
             // Then invoke the linker, writing to another temporary file.
             let res = Command::new("ld")
@@ -188,6 +202,7 @@ fn do_compile<I, W>(source: I, mut out: W, emit: Emit, optimize: bool)
                     slice::from_raw_parts(src, size),
                     &mut *(state as *mut W)
                 )};
+                // Cannot unwrap here; panic must not cross FFI boundary.
                 let _res = out.write_all(src);
                 0
             }
@@ -203,6 +218,7 @@ fn do_compile<I, W>(source: I, mut out: W, emit: Emit, optimize: bool)
     }
 }
 
+/// Get a value which is a pointer to a static constant.
 fn ptr_to_const(llmod: LLVMModuleRef, ty: LLVMTypeRef, value: LLVMValueRef, name: &[u8]) -> LLVMValueRef {
     unsafe {
         let g = LLVMAddGlobal(llmod, ty, name.as_ptr() as *const _);
@@ -212,6 +228,7 @@ fn ptr_to_const(llmod: LLVMModuleRef, ty: LLVMTypeRef, value: LLVMValueRef, name
     }
 }
 
+/// Compile a string of Merthese code in a new (assumed empty) function.
 fn compile_merthese<I: Iterator<Item=char>>(ctxt: LLVMContextRef, llfn: LLVMValueRef,
                                             llmod: LLVMModuleRef, mut code: I) {
     unsafe {
@@ -245,18 +262,22 @@ fn compile_merthese<I: Iterator<Item=char>>(ctxt: LLVMContextRef, llfn: LLVMValu
         while let Some(c) = code.next() {
             match c {
                 'm' => {
+                    // Print "merth"
                     LLVMBuildCall(b, rt_print, [v_merth, v_5i8].as_ptr() as *mut _,
                                   2, b"\0".as_ptr() as *const _);
                 }
                 'e' => {
+                    // Print a newline
                     LLVMBuildCall(b, rt_print, [v_newline, v_1i8].as_ptr() as *mut _,
                                   2, b"\0".as_ptr() as *const _);
                 }
                 'r' => {
+                    // Print a space
                     LLVMBuildCall(b, rt_print, [v_space, v_1i8].as_ptr() as *mut _,
                                   2, b"\0".as_ptr() as *const _);
                 }
                 't' => {
+                    // Print a random string of length in range [0, 13.4]
                     let v_len = LLVMBuildCall(b, rt_rand_inrange,
                                               [LLVMConstAdd(
                                                   LLVMConstFPToUI(
@@ -269,6 +290,7 @@ fn compile_merthese<I: Iterator<Item=char>>(ctxt: LLVMContextRef, llfn: LLVMValu
                                   1, b"\0".as_ptr() as *const _);
                 }
                 'h' => {
+                    // Skip characters through the next 'h', or to end of input.
                     loop {
                         match code.next() {
                             Some('h') | None => break,
@@ -276,7 +298,7 @@ fn compile_merthese<I: Iterator<Item=char>>(ctxt: LLVMContextRef, llfn: LLVMValu
                         }
                     }
                 }
-                _ => { /* Ignore */ }
+                _ => { /* Ignore all other characters */ }
             }
         }
 
@@ -287,6 +309,7 @@ fn compile_merthese<I: Iterator<Item=char>>(ctxt: LLVMContextRef, llfn: LLVMValu
 
 type LLVMError = String;
 
+/// Load a blob of textual IR and build a module.
 fn module_from_blob(ctxt: LLVMContextRef, code: &[u8]) -> Result<LLVMModuleRef, LLVMError> {
     // ParseIRInContext seems to assume a null-terminated buffer, so sadly
     // we must reallocate.
@@ -297,7 +320,7 @@ fn module_from_blob(ctxt: LLVMContextRef, code: &[u8]) -> Result<LLVMModuleRef, 
     unsafe {
         // Buffer length excludes the null terminator, confusingly.
         let mbuf = LLVMCreateMemoryBufferWithMemoryRange(code.as_ptr() as *const _,
-                                                         code.len() - 1 as size_t,
+                                                         code.len() - 1 as libc::size_t,
                                                          b"\0".as_ptr() as *const _, 1);
 
         let mut module: LLVMModuleRef = mem::uninitialized();
@@ -317,7 +340,10 @@ fn module_from_blob(ctxt: LLVMContextRef, code: &[u8]) -> Result<LLVMModuleRef, 
     }
 }
 
-// This takes ownership of the modules
+/// Link together a set of modules into one.
+///
+/// Merges all of the modules yielded from `iter` into `main`, returning
+/// `main` after linking.
 fn link_modules<I: IntoIterator<Item=LLVMModuleRef>>(main: LLVMModuleRef, iter: I) -> LLVMModuleRef {
     use llvm::linker::LLVMLinkModules;
     use llvm::linker::LLVMLinkerMode::*;
@@ -330,6 +356,11 @@ fn link_modules<I: IntoIterator<Item=LLVMModuleRef>>(main: LLVMModuleRef, iter: 
     main
 }
 
+/// Perform optimization of `llmod` with link-time optimizations.
+///
+/// Symbol names present in `externals` will have their visibility unchanged;
+/// all others will be marked as private, enabling better inlining and eliminating
+/// any symbols that need not be present in the output.
 fn optimize_lto(llmod: LLVMModuleRef, externals: &[&[u8]]) -> LLVMModuleRef {
     use llvm::transforms::pass_manager_builder::*;
 
@@ -370,6 +401,7 @@ fn optimize_lto(llmod: LLVMModuleRef, externals: &[&[u8]]) -> LLVMModuleRef {
     llmod
 }
 
+/// Run single-module optimizations over `llmod`.
 fn optimize_module(llmod: LLVMModuleRef) -> LLVMModuleRef {
     use llvm::transforms::pass_manager_builder::*;
 
@@ -406,6 +438,7 @@ fn optimize_module(llmod: LLVMModuleRef) -> LLVMModuleRef {
     }
 }
 
+/// Write code for a module with the given target triple to a `io::Write`.
 fn write_target_code<W: std::io::Write>(triple: &CStr, llmod: LLVMModuleRef,
                                         ty: LLVMCodeGenFileType, mut w: W) -> std::io::Result<()> {
     use llvm::target_machine::*;
@@ -424,17 +457,21 @@ fn write_target_code<W: std::io::Write>(triple: &CStr, llmod: LLVMModuleRef,
 
         let mut mbuf: LLVMMemoryBufferRef = mem::uninitialized();
         LLVMTargetMachineEmitToMemoryBuffer(tm, llmod, ty, ptr::null_mut(), &mut mbuf);
-        let out = w.write_all(membuf_as_slice(mbuf));
+        let out = w.write_all(membuf_as_slice(&mbuf));
 
+        LLVMDisposeMemoryBuffer(mbuf);
         LLVMDisposeTargetMachine(tm);
         out
     }
 }
 
-unsafe fn membuf_as_slice<'a>(mbuf: LLVMMemoryBufferRef) -> &'a [u8] {
-    let p = LLVMGetBufferStart(mbuf);
-    let len = LLVMGetBufferSize(mbuf);
-    slice::from_raw_parts(p as *const _, len as usize)
+/// Get a slice over the contents of a LLVM memory buffer.
+fn membuf_as_slice<'a>(mbuf: &'a LLVMMemoryBufferRef) -> &'a [u8] {
+    unsafe {
+        let p = LLVMGetBufferStart(*mbuf);
+        let len = LLVMGetBufferSize(*mbuf);
+        slice::from_raw_parts(p as *const _, len as usize)
+    }
 }
 
 // PHF mapping for target->runtime module files
@@ -456,6 +493,9 @@ impl From<LLVMError> for RuntimeLoadError {
     }
 }
 
+/// Load the runtime library for a given target triple.
+///
+/// Optionally optimizes the modules individually.
 fn load_runtime_for_target(ctxt: LLVMContextRef, target: &CStr, optimize: bool)
         -> Result<Vec<LLVMModuleRef>, RuntimeLoadError> {
     let mut rt_modules = Vec::with_capacity(RT_SOURCES.len() + 1);
