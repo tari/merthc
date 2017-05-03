@@ -6,7 +6,7 @@ dependencies = [
  "env_logger 0.4.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "gcc 0.3.45 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc 0.2.22 (registry+https://github.com/rust-lang/crates.io-index)",
- "llvm-sys 40.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "llvm-sys 40.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "log 0.3.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "phf 0.7.21 (registry+https://github.com/rust-lang/crates.io-index)",
  "phf_codegen 0.7.21 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -68,7 +68,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "llvm-sys"
-version = "40.0.0"
+version = "40.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
  "gcc 0.3.45 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -257,7 +257,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 "checksum kernel32-sys 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)" = "7507624b29483431c0ba2d82aece8ca6cdba9382bff4ddd0f7490560c056098d"
 "checksum lazy_static 0.2.8 (registry+https://github.com/rust-lang/crates.io-index)" = "3b37545ab726dd833ec6420aaba8231c5b320814b9029ad585555d2a03e94fbf"
 "checksum libc 0.2.22 (registry+https://github.com/rust-lang/crates.io-index)" = "babb8281da88cba992fa1f4ddec7d63ed96280a1a53ec9b919fd37b53d71e502"
-"checksum llvm-sys 40.0.0 (registry+https://github.com/rust-lang/crates.io-index)" = "1f8e98aa6cac62729d3dbe4902ac064e78c19de02d22016db9884b19dc70e65b"
+"checksum llvm-sys 40.0.1 (registry+https://github.com/rust-lang/crates.io-index)" = "cda6384f13044e8c721be4c7d557618bd8c7dc34fb5c134727d9581c835ab4bf"
 "checksum log 0.3.7 (registry+https://github.com/rust-lang/crates.io-index)" = "5141eca02775a762cc6cd564d8d2c50f67c0ea3a372cbf1c51592b3e029e10ad"
 "checksum memchr 1.0.1 (registry+https://github.com/rust-lang/crates.io-index)" = "1dbccc0e46f1ea47b9f17e6d67c5a96bd27030519c519c9c91327e31275a47b4"
 "checksum phf 0.7.21 (registry+https://github.com/rust-lang/crates.io-index)" = "cb325642290f28ee14d8c6201159949a872f220c62af6e110a56ea914fbe42fc"

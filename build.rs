@@ -25,7 +25,9 @@ fn generate_runtime() {
     let path = Path::new(&env::var("OUT_DIR").unwrap()).join("rt_map.rs");
     let mut file = BufWriter::new(File::create(&path).unwrap());
 
-    write!(&mut file, "static RT_TARGET_SOURCES: phf::Map<&'static str, &'static [u8]> =").unwrap();
+    write!(&mut file,
+           "static RT_TARGET_SOURCES: phf::Map<&'static str, &'static [u8]> =")
+            .unwrap();
     let mut phf = phf_codegen::Map::new();
 
     rt_file!(phf, "x86_64-unknown-linux-gnu", "linux-x86_64");
@@ -36,10 +38,10 @@ fn generate_runtime() {
 
 fn build_cpp_helpers() {
     let cfg = Command::new("llvm-config")
-                      .arg("--cxxflags")
-                      .output()
-                      .expect("Failed to execute llvm-config")
-                      .stdout;
+        .arg("--cxxflags")
+        .output()
+        .expect("Failed to execute llvm-config")
+        .stdout;
     let cfg = str::from_utf8(&cfg).expect("llvm-config emitted invalid UTF-8");
 
     let mut cc = gcc::Config::new();
