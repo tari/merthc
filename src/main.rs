@@ -50,12 +50,15 @@ Options:
                     Default: link.
     --no-opt        Disable optimization (default enabled).
     -o OUTFILE      Write output to OUTFILE.
+    --no-rt         Do not link the runtime library. Default enabled,
+                    incompatible with --emit link.
 ";
 
 #[derive(Debug, RustcDecodable)]
 struct Args {
     flag_emit: Option<Emit>,
     flag_no_opt: Option<bool>,
+    flag_no_rt: Option<bool>,
     arg_source: Option<String>,
     arg_outfile: Option<String>
 }
@@ -67,6 +70,7 @@ fn main() {
     env_logger::init().unwrap();
     let Args {
         flag_no_opt: no_optimize,
+        flag_no_rt: no_rt,
         flag_emit: emit,
         arg_source: inpath,
         arg_outfile: outpath,
@@ -75,8 +79,12 @@ fn main() {
                           .argv(std::env::args())
                           .decode().unwrap_or_else(|e| e.exit());
 
-    let optimize = !no_optimize.unwrap_or(false);
     let emit = emit.unwrap_or(Emit::Link);
+    let optimize = !no_optimize.unwrap_or(false);
+    let use_runtime = !no_rt.unwrap_or(false);
+    if emit == Emit::Link && !use_runtime {
+        panic!("--no-rt and --emit link options may not be used together");
+    };
 
     let outpath = if outpath.is_none() {
         // Select a default output filename
@@ -119,11 +127,11 @@ fn main() {
     }
     let outfile = oo.open(outpath).expect("Failed to open output file for writing");
 
-    do_compile(s.chars(), outfile, emit, optimize);
+    do_compile(s.chars(), outfile, emit, optimize, use_runtime);
 }
 
 /// Do compilation of source, emitting the requested output format to `out`.
-fn do_compile<I, W>(source: I, mut out: W, emit: Emit, optimize: bool)
+fn do_compile<I, W>(source: I, mut out: W, emit: Emit, optimize: bool, use_runtime: bool)
         where I: Iterator<Item=char>,
               W: std::io::Write {
     unsafe {
@@ -133,24 +141,29 @@ fn do_compile<I, W>(source: I, mut out: W, emit: Emit, optimize: bool)
     }
     let ctxt = unsafe { LLVMContextCreate() };
 
-    // Load and optimize the runtime files.
     let target = unsafe {
         CString::from_raw(LLVMGetDefaultTargetTriple())
     };
-    let runtime_modules = match load_runtime_for_target(ctxt, &target, optimize) {
-        Ok(x) => x,
-        Err(RuntimeLoadError::NoSuchPlatform) => {
-            println!("Runtime for platform '{}' has no implementation. Sorry!",
-                     target.to_string_lossy());
-            return
-        }
-        e => panic!("Invalid IR while loading runtime: {:?}", e)
+
+    let runtime_modules = if use_runtime {
+        // Load runtime files and maybe optimize them individually.
+        Some(match load_runtime_for_target(ctxt, &target, optimize) {
+            Ok(x) => x,
+            Err(RuntimeLoadError::NoSuchPlatform) => {
+                println!("Runtime for platform '{}' has no implementation. Sorry!",
+                         target.to_string_lossy());
+                return
+            }
+            e => panic!("Invalid IR while loading runtime: {:?}", e)
+        })
+    } else {
+        None
     };
 
     // Build main()
     let (main_module, main_function) = unsafe {
         let ty_void = LLVMVoidType();
-        let main_module = LLVMModuleCreateWithNameInContext(b"main\0".as_ptr() as *const _, ctxt);
+        let main_module = LLVMModuleCreateWithName(b"main\0".as_ptr() as *const _);
         let ty_fn_main = LLVMFunctionType(ty_void, ptr::null_mut(), 0, 0);
         let main_function = LLVMAddFunction(main_module, b"main\0".as_ptr() as *const _, ty_fn_main);
 
@@ -158,25 +171,36 @@ fn do_compile<I, W>(source: I, mut out: W, emit: Emit, optimize: bool)
     };
 
     compile_merthese(ctxt, main_function, main_module, source);
+    verify_module(main_module);
 
-    // Combine main() and runtime
-    link_modules(main_module, runtime_modules);
-    // Do LTO if desired
-    if optimize {
-        optimize_lto(main_module, &[b"_start"]);
+    let output_module: LLVMModuleRef;
+    if let Some(rt) = runtime_modules {
+        output_module = unsafe {
+            LLVMModuleCreateWithName(b"merthc\0".as_ptr() as *const _)
+        };
+        link_modules(output_module, main_module);
+        for rtm in rt {
+            link_modules(output_module, rtm);
+        }
+        // Do LTO if desired
+        if optimize {
+            optimize_lto(output_module, &[b"_start"]);
+        }
+    } else {
+        output_module = main_module;
     }
 
     match emit {
-        Emit::Obj => write_target_code(&target, main_module, LLVMObjectFile, out)
+        Emit::Obj => write_target_code(&target, output_module, LLVMObjectFile, out)
             .expect("Failed to write object code"),
-        Emit::Asm => write_target_code(&target, main_module, LLVMAssemblyFile, out)
+        Emit::Asm => write_target_code(&target, output_module, LLVMAssemblyFile, out)
             .expect("Failed to write assembly file"),
         Emit::Link => {
             let mut obj = NamedTempFile::new().expect("Failed to create temporary object file");
             let mut temp_bin = NamedTempFile::new().expect("Failed to create temporary binary file");
 
             // Kind of a mess. First write object code to a temporary file.
-            write_target_code(&target, main_module, LLVMObjectFile, &mut obj)
+            write_target_code(&target, output_module, LLVMObjectFile, &mut obj)
                 .expect("Failed to write object code to temporary file");
 
             // Then invoke the linker, writing to another temporary file.
@@ -189,27 +213,14 @@ fn do_compile<I, W>(source: I, mut out: W, emit: Emit, optimize: bool)
             // Permit removal of the object file. We don't need it anymore.
             let _ = obj;
             if !res.success() {
-                panic!("ld returned failure");
+                panic!("linking failed: {}", res);
             }
 
             // Now move the temp binary to output.
             std::io::copy(&mut temp_bin, &mut out).expect("Unable to write output binary");
         },
         Emit::Ir => {
-            extern "C" fn module_ir_printer<W: std::io::Write>(src: *const u8, size: libc::size_t,
-                                                               state: *mut libc::c_void) -> libc::c_int {
-                let (src, out) = unsafe {(
-                    slice::from_raw_parts(src, size),
-                    &mut *(state as *mut W)
-                )};
-                // Cannot unwrap here; panic must not cross FFI boundary.
-                let _res = out.write_all(src);
-                0
-            }
-
-            unsafe {
-                PrintModuleIR(main_module, module_ir_printer::<W>, &mut out as *mut W as *mut libc::c_void);
-            }
+            dump_module_ir(output_module, out);
         }
     }
 
@@ -232,20 +243,20 @@ fn ptr_to_const(llmod: LLVMModuleRef, ty: LLVMTypeRef, value: LLVMValueRef, name
 fn compile_merthese<I: Iterator<Item=char>>(ctxt: LLVMContextRef, llfn: LLVMValueRef,
                                             llmod: LLVMModuleRef, mut code: I) {
     unsafe {
-        let bb_main = LLVMAppendBasicBlockInContext(ctxt, llfn, b"\0".as_ptr() as *const _);
-        let b = LLVMCreateBuilderInContext(ctxt);
+        let bb_main = LLVMAppendBasicBlock(llfn, b"\0".as_ptr() as *const _);
+        let b = LLVMCreateBuilder();
         LLVMPositionBuilderAtEnd(b, bb_main);
 
         // Types
-        let ty_void = LLVMVoidTypeInContext(ctxt);
-        let ty_i8 = LLVMIntTypeInContext(ctxt, 8);
+        let ty_void = LLVMVoidType();
+        let ty_i8 = LLVMIntType(8);
         let ty_i8p = LLVMPointerType(ty_i8, 0);
         let ty_rt_rand_inrange = LLVMFunctionType(ty_i8, [ty_i8].as_ptr() as *mut _, 1, 0);
         let ty_rt_rand_string = LLVMFunctionType(ty_void, [ty_i8].as_ptr() as *mut _, 1, 0);
         let ty_rt_print = LLVMFunctionType(ty_void, [ty_i8p, ty_i8].as_ptr() as *mut _, 2, 0);
         // Runtime functions
-        let rt_rand_inrange = LLVMAddGlobal(llmod, ty_rt_rand_inrange, b"rand_inrange\0".as_ptr() as *const _);
-        let rt_rand_string = LLVMAddGlobal(llmod, ty_rt_rand_string, b"rand_string\0".as_ptr() as *const _);
+        let rt_rand_inrange = LLVMAddFunction(llmod, b"rand_inrange\0".as_ptr() as *const _, ty_rt_rand_inrange);
+        let rt_rand_string = LLVMAddFunction(llmod, b"rand_string\0".as_ptr() as *const _, ty_rt_rand_string);
         let rt_print = LLVMAddFunction(llmod, b"print\0".as_ptr() as *const _, ty_rt_print);
 
         // Constant ints
@@ -281,7 +292,7 @@ fn compile_merthese<I: Iterator<Item=char>>(ctxt: LLVMContextRef, llfn: LLVMValu
                     let v_len = LLVMBuildCall(b, rt_rand_inrange,
                                               [LLVMConstAdd(
                                                   LLVMConstFPToUI(
-                                                      LLVMConstReal(LLVMFloatTypeInContext(ctxt), 13.4), ty_i8
+                                                      LLVMConstReal(LLVMFloatType(), 13.4), ty_i8
                                                   ),
                                                   v_1i8
                                               )].as_ptr() as *mut _,
@@ -313,7 +324,6 @@ type LLVMError = String;
 fn module_from_blob(ctxt: LLVMContextRef, code: &[u8]) -> Result<LLVMModuleRef, LLVMError> {
     // ParseIRInContext seems to assume a null-terminated buffer, so sadly
     // we must reallocate.
-    trace!("Compiling module from IR: {}", &String::from_utf8_lossy(code));
     let mut code: Vec<u8> = code.into();
     code.push(0);
 
@@ -335,6 +345,7 @@ fn module_from_blob(ctxt: LLVMContextRef, code: &[u8]) -> Result<LLVMModuleRef, 
                 CStr::from_ptr(err_msg).to_string_lossy().into_owned()
             )
         } else {
+            verify_module(module);
             Ok(module)
         }
     }
@@ -344,15 +355,23 @@ fn module_from_blob(ctxt: LLVMContextRef, code: &[u8]) -> Result<LLVMModuleRef, 
 ///
 /// Merges all of the modules yielded from `iter` into `main`, returning
 /// `main` after linking.
-fn link_modules<I: IntoIterator<Item=LLVMModuleRef>>(main: LLVMModuleRef, iter: I) -> LLVMModuleRef {
-    use llvm::linker::LLVMLinkModules;
-    use llvm::linker::LLVMLinkerMode::*;
+fn link_modules(main: LLVMModuleRef, other: LLVMModuleRef) -> LLVMModuleRef {
+    use llvm::linker::LLVMLinkModules2;
 
-    for llmod in iter {
-        unsafe {
-            LLVMLinkModules(main, llmod, LLVMLinkerDestroySource, ptr::null_mut());
-        }
+    let mut buf: Vec<u8> = vec![];
+    dump_module_ir(main, &mut buf);
+    trace!("BEGIN LINK:\n{}", String::from_utf8(buf).expect("bad characters"));
+    trace!("==="); 
+
+    unsafe {
+        LLVMLinkModules2(main, other);
     }
+
+    let mut buf: Vec<u8> = vec![];
+    dump_module_ir(main, &mut buf);
+    trace!("LINK COMPLETE: {}", String::from_utf8(buf).expect("bad characters"));
+    trace!("===");
+
     main
 }
 
@@ -522,4 +541,30 @@ fn load_runtime_for_target(ctxt: LLVMContextRef, target: &CStr, optimize: bool)
 
     rt_modules.push(target_rt);
     Ok(rt_modules)
+}
+
+fn dump_module_ir<W: std::io::Write>(module: LLVMModuleRef, mut out: W) {
+    extern "C" fn module_ir_printer<W: std::io::Write>(src: *const u8, size: libc::size_t,
+                                                       state: *mut libc::c_void) -> libc::c_int {
+        let (src, out) = unsafe {(
+            slice::from_raw_parts(src, size),
+            &mut *(state as *mut W)
+        )};
+        // Cannot unwrap here; panic must not cross FFI boundary.
+        let _res = out.write_all(src);
+        0
+    }
+
+    unsafe {
+        PrintModuleIR(module, module_ir_printer::<W>, &mut out as *mut W as *mut libc::c_void);
+    }
+}
+
+fn verify_module(llmod: LLVMModuleRef) {
+    if cfg!(debug_assertions) {
+        unsafe {
+            use llvm::analysis::{LLVMVerifyModule, LLVMVerifierFailureAction};
+            LLVMVerifyModule(llmod, LLVMVerifierFailureAction::LLVMPrintMessageAction, ptr::null_mut());
+        }
+    }
 }

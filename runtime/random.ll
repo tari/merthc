@@ -1,13 +1,13 @@
 
 @x = private unnamed_addr global i64 0
 
-define hidden void @rand_init(i64 %seed) {
+define void @rand_init(i64 %seed) {
     store i64 %seed, i64* @x
     ret void
 }
 
 ; 64-bit xorshift*
-define hidden i64 @rand() {
+define i64 @rand() {
     %x0 = load i64, i64* @x
 ;   x ^= x >> 12;
     %xr12 = lshr i64 %x0, 12
@@ -25,7 +25,7 @@ define hidden i64 @rand() {
     ret i64 %out
 }
 
-define hidden i8 @rand_inrange(i8 %max0) {
+define i8 @rand_inrange(i8 %max0) {
     %1 = call i64 @rand()
     %2 = uitofp i64 %1 to double
     %3 = fdiv fast double %2, uitofp(i65 shl(i65 1, i65 64) to double)
@@ -38,7 +38,7 @@ define hidden i8 @rand_inrange(i8 %max0) {
 
 declare void @print(i8*, i8)
 
-define hidden void @rand_string(i8 %len) {
+define void @rand_string(i8 %len) {
     %charmem = alloca i8, i8 %len
     br label %loop
 

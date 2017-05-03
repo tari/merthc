@@ -52,6 +52,17 @@ define private void @exit(i32 %code0) noreturn {
     unreachable
 }
 
+; Runtime support function to print characters to stdout
+define void @print(i8* %buf0, i8 %len0) inlinehint {
+    %nr = load i64, i64* @__NR_write
+    %fileno0 = load i32, i32* @STDOUT_FILENO
+    %fileno = zext i32 %fileno0 to i64
+    %buf = ptrtoint i8* %buf0 to i64
+    %len = zext i8 %len0 to i64
+    call i64 @syscall3(i64 %nr, i64 %fileno, i64 %buf, i64 %len)
+    ret void
+}
+
 ; ===
 
 declare void @main()
@@ -81,15 +92,4 @@ invoke_main:
 exit_fail:
     call void @exit(i32 1)
     unreachable
-}
-
-; Runtime support function to print characters to stdout
-define hidden void @print(i8* %buf0, i8 %len0) inlinehint {
-    %nr = load i64, i64* @__NR_write
-    %fileno0 = load i32, i32* @STDOUT_FILENO
-    %fileno = zext i32 %fileno0 to i64
-    %buf = ptrtoint i8* %buf0 to i64
-    %len = zext i8 %len0 to i64
-    call i64 @syscall3(i64 %nr, i64 %fileno, i64 %buf, i64 %len)
-    ret void
 }
