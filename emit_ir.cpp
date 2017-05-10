@@ -3,7 +3,7 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm-c/Core.h>
 
-typedef int (*cb_t)(const void *, size_t, void *);
+extern "C" typedef int (*cb_t)(const void *, size_t, void *);
 
 class raw_callback_ostream : public llvm::raw_ostream {
     uint64_t offset;
